@@ -1,135 +1,160 @@
+<div align="center">
+
+<img src="assets/hero.png" alt="cc-video" width="100%" />
+
 # cc-video
 
-**Deep video understanding for Claude Code.** Shot-aware, cross-modal — not
-uniform frame sampling.
+**Deep video understanding for Claude Code.**
+Shot-aware. Cross-modal. Beyond uniform frame sampling.
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-windows%20%7C%20macOS%20%7C%20linux-lightgrey.svg)](#)
+
+</div>
+
+---
+
+## What it does
 
 ```
-video → shots → per-shot keyframes → ASR (+ speakers) → OCR → per-shot VLM caption
+video → shots → keyframes/shot → ASR + diarization → OCR → VLM caption/shot
       → cross-modal merger → video.understanding.md  (Claude reads this)
 ```
 
-## What this gives Claude that uniform sampling can't
+Instead of grabbing frames at a fixed interval and shoveling raw JPEGs into
+the model, `cc-video` runs a structured multimodal pipeline once, persists a
+compact text timeline, and lets Claude work from that on every follow-up
+question.
 
-The conventional approach (e.g. [bradautomates/claude-video `/watch`](https://github.com/bradautomates/claude-video))
-samples frames at a fixed fps, caps at 100 frames, and hands raw JPEGs +
-transcript to Claude. That works for short videos, but:
+---
 
-- A 30-second shot of a static IDE wastes 30+ frames; a 1-second cut between
-  shots gets the same coverage as the boring static one.
-- The transcript has no speakers, no word timestamps.
-- On-screen text (code, terminal, slides) is buried in the image — Claude has to
-  re-OCR every frame visually, burning tokens.
-- Visual descriptions are computed at query time, redundantly for follow-ups.
-- Videos >10 min get a "sparse scan" warning because the 100-frame cap is brutal.
+## Why structure beats uniform sampling
 
-`cc-video` fixes each of these:
+<div align="center">
+<img src="assets/comparison.png" alt="Uniform sampling vs shot-aware" width="85%" />
+</div>
 
-| | `/watch` | `cc-video` |
+Uniform sampling treats a 30-second static IDE shot the same as a 1-second
+hard cut — wasted frames where nothing changes, missed frames where
+everything does.
+
+`cc-video` segments the video first, then samples per shot.
+
+| | Uniform sampling | cc-video |
 |---|---|---|
-| Sampling | Uniform fps, cap 100 | Shot-aware, 1-5 keyframes per shot, no cap |
-| Transcript | Plain segments | Word-level + speaker diarization (WhisperX) |
-| OCR | — | PaddleOCR per keyframe → per-shot deduped block |
-| Visual description | Raw frames dumped to Claude context | Pre-captioned per shot by Gemini 2.5 |
-| Long video | "Sparse scan" >10min | Full coverage regardless of length |
-| Cross-modal | — | Speaker timeline aligned to shot timeline |
-| Re-query | Re-runs everything | `cc-video query` greps cached JSON |
+| **Frame budget** | Fixed fps, hard cap | 1–5 per shot, no cap |
+| **Transcript** | Plain segments | Word-level + speaker diarization |
+| **On-screen text** | Re-OCR'd visually each query | PaddleOCR per keyframe → deduped per shot |
+| **Visual description** | Raw frames burned into context | Pre-captioned per shot by Gemini |
+| **Long videos** | "Sparse scan" warning past 10 min | Full coverage regardless of length |
+| **Re-query cost** | Re-runs everything | `cc-video query` greps cached JSON |
+
+---
 
 ## Quick start
 
 ```bash
-# install (Python 3.10+)
-pip install -e .                  # core only — needs ffmpeg + yt-dlp + scenedetect
-pip install -e '.[asr]'           # + faster-whisper + pyannote (local transcripts)
+# install — Python 3.10+
+pip install -e .                  # core: ffmpeg + yt-dlp + scenedetect
+pip install -e '.[asr]'           # + faster-whisper + pyannote (local transcript)
 pip install -e '.[ocr]'           # + PaddleOCR
 pip install -e '.[vlm]'           # + google-genai for shot captions
 pip install -e '.[all]'           # everything
 
 # binaries (one-time)
-brew install ffmpeg yt-dlp        # macOS
+brew install ffmpeg yt-dlp                       # macOS
 sudo apt install ffmpeg && pipx install yt-dlp   # Linux
 winget install ffmpeg && pip install yt-dlp      # Windows
 
-# preflight
-python3 scripts/setup.py
-
 # run
-cc-video analyze sample.mp4 --out-dir ./out
-cc-video analyze https://youtu.be/abc --out-dir ./out
+cc-video analyze sample.mp4
+cc-video analyze https://youtu.be/abc
 
 # query the cached analysis (no re-run)
-cc-video query ./out "what tool was used to deploy"
+cc-video query ./out/<video-id>-<timestamp> "what tool was used to deploy"
 ```
 
-The output:
+Output lands in a per-video timestamped folder:
 
 ```
-out/
-├── video.understanding.md      # Claude reads this (timeline + transcript)
+out/<video-id>-<YYMMDD-HHMMSS>/
+├── video.understanding.md      # Claude reads this — full timeline + transcript
 ├── video.understanding.json    # programmatic access
 ├── keyframes/                  # only the selected frames
-│   ├── shot0000_middle.jpg
-│   ├── shot0001_start.jpg
+│   ├── shot0000_cluster-0.jpg
+│   ├── shot0001_cluster-1.jpg
 │   └── …
-└── audio.wav                   # if ASR ran
+├── audio.wav                   # if ASR ran
+└── download/                   # the source video + info.json
 ```
+
+---
 
 ## Pipeline detail
 
-1. **Probe** (`probe.py`) — ffprobe for duration/resolution/audio.
-2. **Download** (`download.py`) — yt-dlp for URLs (also fetches native captions);
-   local files pass through.
-3. **Shot detection** (`shots.py`) — PySceneDetect `AdaptiveDetector` with a
-   rolling-average threshold robust to camera motion. Micro-shots <0.6s are
-   merged into neighbors.
-4. **Keyframes** (`keyframes.py`) — middle frame per shot by default; shots >8s
-   get start+middle+end. `--deep-keyframes` runs CLIP embedding + k-means inside
-   each shot to pick diverse representatives.
-5. **Transcript** (`transcript.py`) — three-way fallback:
-   1. yt-dlp native captions if present
-   2. faster-whisper local (with pyannote diarization if `HF_TOKEN` set)
-   3. Whisper API (Groq → OpenAI)
-6. **OCR** (`ocr.py`) — PaddleOCR per keyframe, deduped per shot.
-7. **VLM caption** (`vlm.py`) — Gemini 2.5 reads (keyframes + transcript-in-shot
-   + OCR-in-shot) and returns structured JSON: action, setting,
-   on_screen_text_summary, notable_objects, change_from_prev.
-8. **Merger** (`merger.py`) — slice transcript by shot boundaries; group
-   consecutive similar shots into chapters via setting-token Jaccard similarity.
-9. **Output** (`output.py`) — render Markdown timeline + JSON.
+| Step | Module | What it does |
+|---|---|---|
+| 1 | `probe.py`   | `ffprobe` for duration, resolution, audio presence |
+| 2 | `download.py`| `yt-dlp` for URLs (subtitles optional); local files pass through |
+| 3 | `shots.py`   | PySceneDetect `AdaptiveDetector` with rolling-average threshold robust to camera motion. Micro-shots <0.6s merged into neighbors |
+| 4 | `keyframes.py` | Middle frame per shot by default; shots >8s get start+middle+end. `--deep-keyframes` runs CLIP embeddings + k-means inside each shot for diverse representatives |
+| 5 | `transcript.py` | Three-way fallback: Groq Whisper API → faster-whisper local → OpenAI Whisper API. Word timestamps included. Audio auto-compressed if API size limit hit |
+| 5b | `transcript.py` (cont.) | Pyannote speaker diarization layered onto whichever transcript backend ran (decoupled — works with API or local) |
+| 6 | `ocr.py`     | PaddleOCR per keyframe, deduped per shot. Language auto-detected from transcript (Vietnamese diacritics → `lang=vi`, else fallback) |
+| 7 | `vlm.py`     | Gemini 2.5 reads (keyframes + transcript-in-shot + OCR-in-shot) and returns structured JSON: `action`, `setting`, `on_screen_text_summary`, `notable_objects`, `change_from_prev`. Retries with backoff on 429/503 |
+| 8 | `merger.py`  | Slice transcript by shot boundaries; group consecutive similar shots into chapters via setting-token Jaccard similarity |
+| 9 | `output.py`  | Render Markdown timeline + JSON |
+
+---
 
 ## Configuration
 
-Env vars (all optional):
+All environment variables are optional. The pipeline degrades gracefully —
+missing key just disables the stage it powers.
 
 | Var | Purpose |
 |---|---|
-| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | Per-shot VLM captioning |
-| `GROQ_API_KEY` | Whisper API fallback (preferred — fast, cheap) |
-| `OPENAI_API_KEY` | Whisper API fallback (alt) |
-| `HF_TOKEN` | pyannote.audio speaker diarization (needs HF model access) |
+| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | Per-shot VLM captioning. Free tier 250 req/day; paid Tier 1 is 10K req/day at ~$0.10/video |
+| `GROQ_API_KEY` | Whisper API — fast, free, preferred when set |
+| `OPENAI_API_KEY` | Whisper API fallback |
+| `HF_TOKEN` | Pyannote speaker diarization. Requires accepting license for `pyannote/speaker-diarization-3.1` AND `pyannote/segmentation-3.0` on HuggingFace |
 
-Without any keys, cc-video still produces shot detection + keyframes + (if
-`[asr]` extra installed) local faster-whisper transcript + (if `[ocr]` extra
-installed) OCR. The output degrades gracefully — no key just means no VLM
-captions; the timeline still has everything else.
-
-## Claude Code integration
+### CLI flags
 
 ```bash
-# Install as a skill
-git clone https://github.com/anthropics/cc-video.git ~/.claude/skills/cc-video
-pip install -e ~/.claude/skills/cc-video
+cc-video analyze <source>
+  --out-dir ./out             # parent dir (default ./out). Outputs go to ./out/<slug>-<timestamp>/
+  --no-deep-keyframes         # disable CLIP clustering (deep keyframes are on by default)
+  --no-vlm                    # skip Gemini per-shot captioning
+  --no-ocr                    # skip PaddleOCR
+  --no-asr                    # skip transcription entirely
+  --whisper-model large-v3    # tiny|base|small|medium|large-v3 (for local Whisper path)
+  --vlm-model gemini-2.5-flash  # or gemini-2.5-pro for higher quality, lower quota
+  --resolution 1080           # keyframe width in px (default 1080)
 ```
 
-In Claude Code:
+---
+
+## Use as a Claude Code skill
+
+```bash
+git clone https://github.com/tvtdev94/cc-video.git ~/.claude/skills/cc-video
+pip install -e ~/.claude/skills/cc-video[all]
+```
+
+Then in Claude Code:
 
 ```
 /cc-video https://youtu.be/abc what stack did they use?
 /cc-video screen-recording.mp4 where does the error appear?
 ```
 
-The skill (`SKILL.md`) instructs Claude to run `cc-video analyze`, then `Read`
-the resulting `video.understanding.md`. Only individual keyframe JPEGs are
-opened if the question needs detail beyond the captions.
+The skill (`SKILL.md`) tells Claude to run `cc-video analyze`, then `Read`
+the resulting `video.understanding.md`. Individual keyframe JPEGs are
+opened only when the question needs detail past the per-shot captions.
+
+---
 
 ## License
 
