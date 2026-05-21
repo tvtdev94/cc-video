@@ -71,6 +71,9 @@ winget install ffmpeg && pip install yt-dlp      # Windows
 cc-video analyze sample.mp4
 cc-video analyze https://youtu.be/abc
 
+# resume an interrupted run (everything completed so far is reused)
+cc-video analyze --resume ./out/<video-id>-<timestamp>
+
 # query the cached analysis (no re-run)
 cc-video query ./out/<video-id>-<timestamp> "what tool was used to deploy"
 ```
@@ -86,8 +89,18 @@ out/<video-id>-<YYMMDD-HHMMSS>/
 │   ├── shot0001_cluster-1.jpg
 │   └── …
 ├── audio.wav                   # if ASR ran
-└── download/                   # the source video + info.json
+├── download/                   # the source video + info.json
+└── state/                      # per-stage checkpoints — auto-resume
+    ├── shots.json
+    ├── keyframes.json
+    ├── transcript.json
+    ├── ocr.jsonl               # appended per frame as OCR completes
+    └── vlm.jsonl               # appended per shot as captions return
 ```
+
+Every stage writes to `state/` as it completes. Re-running with `--resume`
+picks up exactly where it left off — interrupted OCR resumes per-frame,
+interrupted VLM resumes per-shot. No redo, no rate-limit re-burn.
 
 ---
 
