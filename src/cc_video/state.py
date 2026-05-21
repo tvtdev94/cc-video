@@ -88,6 +88,14 @@ class Store:
         with self.path(name).open("a", encoding="utf-8") as f:
             f.write(json.dumps(_to_dict(obj), ensure_ascii=False) + "\n")
 
+    def jsonl_rewrite(self, name: str, items: Iterable[Any]) -> None:
+        """Atomically replace JSONL contents with `items`."""
+        tmp = self.path(name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            for it in items:
+                f.write(json.dumps(_to_dict(it), ensure_ascii=False) + "\n")
+        tmp.replace(self.path(name))
+
 
 def _to_dict(obj: Any) -> Any:
     if is_dataclass(obj):

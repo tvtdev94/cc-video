@@ -326,7 +326,12 @@ def _vlm_or_reuse(
 
     from .merger import group_keyframes_by_shot, group_ocr_by_shot, slice_transcript_per_shot
 
-    prev = store.jsonl_load_all("vlm.jsonl", _caption_from_dict)
+    prev_all = store.jsonl_load_all("vlm.jsonl", _caption_from_dict)
+    prev = [c for c in prev_all if not c.change_from_prev.startswith("vlm-error")]
+    if len(prev) < len(prev_all):
+        # Drop error captions so they get retried; rewrite file to match
+        store.jsonl_rewrite("vlm.jsonl", prev)
+        logu.step(f"discarded {len(prev_all) - len(prev)} prior error captions for retry")
     done_indices = {c.shot_index for c in prev}
     pending = [s for s in shots if s.index not in done_indices]
 
